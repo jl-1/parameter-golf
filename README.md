@@ -161,6 +161,21 @@ This splits the model into stem (unique) → body (shared) → head (unique) lay
 
 With the defaults (9 layers, 2 stem, 2 head, 2 kernels), the body has 5 applications alternating between 2 shared blocks.
 
+To fill the 16MB budget, increase the model dimension and add more body applications:
+
+```bash
+RUN_ID=shared_body_wide_sp1024 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+SHARE_BODY=1 \
+MODEL_DIM=640 \
+NUM_LAYERS=15 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py
+```
+
+This gives 2 stem + 11 body applications (alternating 2 shared kernels) + 2 head at width 640. The extra body applications are nearly free since they reuse shared weights.
+
 By default, `train_gpt.py` keeps its ~10 minute wallclock cap. If you want a longer run, override it explicitly, for example `MAX_WALLCLOCK_SECONDS=0`.
 
 By default, this command prints `train_loss` step logs during training and prints `val_loss`, `val_bpb`, and compressed model size in the final `final_int8_zlib_roundtrip` lines at the end. If you want periodic validation logs during the run, set `VAL_LOSS_EVERY`, for example `VAL_LOSS_EVERY=200`. For the baseline config, the final `val_bpb` should land around ~1.2 with a compressed model size under 16MB.
