@@ -69,6 +69,10 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    share_body = bool(int(os.environ.get("SHARE_BODY", "0")))
+    num_stem_layers = int(os.environ.get("NUM_STEM_LAYERS", 2))
+    num_head_layers = int(os.environ.get("NUM_HEAD_LAYERS", 2))
+    num_body_kernels = int(os.environ.get("NUM_BODY_KERNELS", 2))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -617,6 +621,15 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class BodyControl(nn.Module):
+    # Per-application control tensors for a shared body block.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -626,22 +639,25 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        include_controls: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if include_controls:
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+    def forward(self, x: Tensor, x0: Tensor, controls: BodyControl | None = None) -> Tensor:
+        src = controls if controls is not None else self
+        mix = src.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + src.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + src.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -659,6 +675,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        share_body: bool = False,
+        num_stem_layers: int = 2,
+        num_head_layers: int = 2,
+        num_body_kernels: int = 2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,24 +686,36 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.share_body = share_body
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
+
+        def _make_block(include_controls: bool = True) -> Block:
+            return Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, include_controls)
+
+        if share_body:
+            num_body_apps = num_layers - num_stem_layers - num_head_layers
+            if num_body_apps <= 0:
+                raise ValueError(
+                    f"num_layers ({num_layers}) must exceed "
+                    f"num_stem_layers ({num_stem_layers}) + num_head_layers ({num_head_layers})"
                 )
-                for i in range(num_layers)
-            ]
-        )
+            if num_body_kernels < 1:
+                raise ValueError(f"num_body_kernels must be >= 1, got {num_body_kernels}")
+            self.num_stem_layers = num_stem_layers
+            self.num_head_layers = num_head_layers
+            self.num_body_kernels = num_body_kernels
+            self.stem_blocks = nn.ModuleList([_make_block() for _ in range(num_stem_layers)])
+            self.body_kernels = nn.ModuleList([_make_block(include_controls=False) for _ in range(num_body_kernels)])
+            self.body_controls = nn.ModuleList([BodyControl(model_dim) for _ in range(num_body_apps)])
+            self.head_blocks = nn.ModuleList([_make_block() for _ in range(num_head_layers)])
+            self.num_skip_weights = min(num_stem_layers, num_head_layers)
+        else:
+            self.num_encoder_layers = num_layers // 2
+            self.num_decoder_layers = num_layers - self.num_encoder_layers
+            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+            self.blocks = nn.ModuleList([_make_block() for _ in range(num_layers)])
+
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -703,14 +735,29 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        if self.share_body:
+            # Stem: unique layers, store activations for skip connections to head.
+            for block in self.stem_blocks:
+                x = block(x, x0)
+                skips.append(x)
+            # Body: alternating shared kernels with per-application controls.
+            for i, ctrl in enumerate(self.body_controls):
+                kernel = self.body_kernels[i % self.num_body_kernels]
+                x = kernel(x, x0, controls=ctrl)
+            # Head: unique layers, consume skip connections from stem in reverse.
+            for i, block in enumerate(self.head_blocks):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = block(x, x0)
+        else:
+            # Original encoder-decoder with skip connections.
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,6 +882,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        share_body=args.share_body,
+        num_stem_layers=args.num_stem_layers,
+        num_head_layers=args.num_head_layers,
+        num_body_kernels=args.num_body_kernels,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -848,19 +899,22 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    dedicated_param_ids = {id(base_model.tok_emb.weight)}
+    if base_model.lm_head is not None:
+        dedicated_param_ids.add(id(base_model.lm_head.weight))
+    transformer_named_params = [
+        (n, p) for n, p in base_model.named_parameters() if id(p) not in dedicated_param_ids
+    ]
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in transformer_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in transformer_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -894,6 +948,15 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    if args.share_body:
+        num_body_apps = args.num_layers - args.num_stem_layers - args.num_head_layers
+        kernel_params = sum(p.numel() for p in base_model.body_kernels.parameters())
+        ctrl_params = sum(p.numel() for p in base_model.body_controls.parameters())
+        log0(
+            f"shared_body: stem={args.num_stem_layers} body_apps={num_body_apps} "
+            f"kernels={args.num_body_kernels} head={args.num_head_layers} "
+            f"kernel_params={kernel_params} control_params={ctrl_params}"
+        )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
