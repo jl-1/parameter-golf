@@ -974,24 +974,25 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Deduplicate params (shared body blocks reference the same attn/mlp modules)
-    seen_ids: set[int] = set()
-    matrix_params: list[Tensor] = []
-    scalar_params: list[Tensor] = []
-    for name, p in base_model.blocks.named_parameters():
-        if id(p) in seen_ids:
-            continue
-        seen_ids.add(id(p))
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-            matrix_params.append(p)
-        else:
-            scalar_params.append(p)
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
-    if base_model.smear is not None:
-        scalar_params.append(base_model.smear.gate)
+    # Collect transformer params (everything except tok_emb, lm_head, bigram embed/proj)
+    dedicated_param_ids = {id(base_model.tok_emb.weight)}
+    if base_model.lm_head is not None:
+        dedicated_param_ids.add(id(base_model.lm_head.weight))
     if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
+        dedicated_param_ids.add(id(base_model.bigram.embed.weight))
+        if base_model.bigram.proj is not None:
+            dedicated_param_ids.add(id(base_model.bigram.proj.weight))
+    transformer_named_params = [
+        (n, p) for n, p in base_model.named_parameters() if id(p) not in dedicated_param_ids
+    ]
+    matrix_params = [
+        p for name, p in transformer_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p for name, p in transformer_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
