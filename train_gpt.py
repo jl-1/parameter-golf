@@ -93,6 +93,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.0))  # 0 = disabled; e.g. 0.995 to enable
     muon_wd = float(os.environ.get("MUON_WD", 0.0))  # weight decay for Muon optimizer
+    ortho_init = bool(int(os.environ.get("ORTHO_INIT", "0")))  # 0 = default init; 1 = orthogonal init
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -716,12 +717,14 @@ class GPT(nn.Module):
         num_stem_layers: int = 2,
         num_head_layers: int = 2,
         num_body_kernels: int = 2,
+        ortho_init: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
+        self.ortho_init = ortho_init
         self.logit_softcap = logit_softcap
         self.share_body = share_body
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -768,7 +771,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
                     nn.init.zeros_(module.weight)
-                elif module.weight.ndim == 2:
+                elif self.ortho_init and module.weight.ndim == 2:
                     nn.init.orthogonal_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -935,6 +938,7 @@ def main() -> None:
         num_stem_layers=args.num_stem_layers,
         num_head_layers=args.num_head_layers,
         num_body_kernels=args.num_body_kernels,
+        ortho_init=args.ortho_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
