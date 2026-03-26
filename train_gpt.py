@@ -95,6 +95,13 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.0))  # weight decay for Muon optimizer
     ortho_init = bool(int(os.environ.get("ORTHO_INIT", "0")))  # 0 = default init; 1 = orthogonal init
 
+    # Test-time training (TTT): adapt model on eval data before scoring.
+    ttt = bool(int(os.environ.get("TTT", "0")))  # 0 = disabled
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -302,6 +309,93 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_ttt(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Test-time training: score each chunk first, then train on it."""
+    seq_len = args.train_seq_len
+    chunk_tokens = args.ttt_chunk_tokens
+    total_tokens = val_tokens.numel()
+
+    # TTT optimizer: SGD with momentum + cosine LR per chunk
+    ttt_optimizer = torch.optim.SGD(base_model.parameters(), lr=args.ttt_lr, momentum=0.9)
+
+    # Split val into chunks
+    chunk_starts = list(range(0, total_tokens - seq_len, chunk_tokens))
+    num_chunks = len(chunk_starts)
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    for ci, chunk_start in enumerate(chunk_starts):
+        chunk_end = min(chunk_start + chunk_tokens + seq_len, total_tokens)
+        chunk_data = val_tokens[chunk_start:chunk_end].to(device=device, dtype=torch.int64)
+        is_last_chunk = ci == num_chunks - 1
+
+        # Phase 1: SCORE chunk (inference_mode — no graph, no weight mutation)
+        base_model.eval()
+        num_seqs = max((chunk_end - chunk_start - 1) // seq_len, 1)
+        score_tokens = num_seqs * seq_len
+        with torch.inference_mode():
+            for si in range(0, num_seqs, args.ttt_batch_seqs):
+                batch_end = min(si + args.ttt_batch_seqs, num_seqs)
+                batch_size = batch_end - si
+                x_list, y_list = [], []
+                for bi in range(si, batch_end):
+                    start = bi * seq_len
+                    x_list.append(chunk_data[start:start + seq_len])
+                    y_list.append(chunk_data[start + 1:start + seq_len + 1])
+                x = torch.stack(x_list)
+                y = torch.stack(y_list)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = base_model(x, y).detach()
+                batch_token_count = float(y.numel())
+                loss_sum += batch_loss.to(torch.float64) * batch_token_count
+                token_count += batch_token_count
+                prev_ids = x.reshape(-1)
+                tgt_ids = y.reshape(-1)
+                tb = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                byte_count += tb.to(torch.float64).sum()
+
+        # Phase 2: TRAIN on chunk (skip last chunk — nothing to gain)
+        if not is_last_chunk and args.ttt_epochs > 0:
+            base_model.train()
+            # Cosine LR decay across chunks
+            cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+            for pg in ttt_optimizer.param_groups:
+                pg["lr"] = cos_lr
+            for _ep in range(args.ttt_epochs):
+                for si in range(0, num_seqs, args.ttt_batch_seqs):
+                    batch_end = min(si + args.ttt_batch_seqs, num_seqs)
+                    x_list, y_list = [], []
+                    for bi in range(si, batch_end):
+                        start = bi * seq_len
+                        x_list.append(chunk_data[start:start + seq_len])
+                        y_list.append(chunk_data[start + 1:start + seq_len + 1])
+                    x = torch.stack(x_list)
+                    y = torch.stack(y_list)
+                    ttt_optimizer.zero_grad()
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        loss = base_model(x, y)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
+                    ttt_optimizer.step()
+
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1248,6 +1342,24 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zstd_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Test-time training: adapt the quantized model on eval data
+    if args.ttt:
+        # Reload fresh quantized weights (TTT mutates them)
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_loss, ttt_bpb = eval_ttt(
+            args, base_model, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+            f"ttt_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms "
+            f"ttt_lr:{args.ttt_lr} ttt_epochs:{args.ttt_epochs} ttt_chunk:{args.ttt_chunk_tokens}"
+        )
+        log0(f"final_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
