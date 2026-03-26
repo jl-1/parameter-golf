@@ -73,6 +73,7 @@ class Hyperparameters:
     num_stem_layers = int(os.environ.get("NUM_STEM_LAYERS", 2))
     num_head_layers = int(os.environ.get("NUM_HEAD_LAYERS", 2))
     num_body_kernels = int(os.environ.get("NUM_BODY_KERNELS", 2))
+    eval_body_apps = int(os.environ.get("EVAL_BODY_APPS", 0))  # 0 = same as training
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -761,7 +762,6 @@ class GPT(nn.Module):
             for block in self.stem_blocks:
                 x = block(x, x0)
                 skips.append(x)
-            x_stem = x  # save final stem output for body residual connections
             # Body: alternating shared kernels, pure iterative refinement.
             for i in range(self.num_body_apps):
                 kernel = self.body_kernels[i % self.num_body_kernels]
@@ -1202,6 +1202,28 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Evaluate with extra body applications at inference (free depth)
+    if args.share_body:
+        train_body_apps = base_model.num_body_apps
+        extra_counts = []
+        for extra in [2, 4]:
+            candidate = train_body_apps + extra
+            extra_counts.append(candidate)
+        for n_body in extra_counts:
+            base_model.num_body_apps = n_body
+            torch.cuda.synchronize()
+            t_extra = time.perf_counter()
+            extra_loss, extra_bpb = eval_val(
+                args, base_model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"eval_body_apps:{n_body} val_loss:{extra_loss:.4f} val_bpb:{extra_bpb:.4f} "
+                f"eval_time:{1000.0 * (time.perf_counter() - t_extra):.0f}ms"
+            )
+        base_model.num_body_apps = train_body_apps  # restore
 
     if distributed:
         dist.destroy_process_group()
