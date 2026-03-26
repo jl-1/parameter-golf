@@ -1260,68 +1260,75 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
 
-def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
+def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int, bank_idx_fn=None) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
-    n = num_layers
+    bi = bank_idx_fn if bank_idx_fn is not None else (lambda i: i)
+    nb = sd["qo_bank"].shape[0] // 2  # infer nb from actual bank size
     for name, tensor in sd.items():
         if name == "qo_bank":
-            for i in range(n):
-                out[f"blocks.{i}.attn.c_q.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.proj.weight"] = tensor[n + i]
+            for i in range(num_layers):
+                b = bi(i)
+                out[f"blocks.{i}.attn.c_q.weight"] = tensor[b]
+                out[f"blocks.{i}.attn.proj.weight"] = tensor[nb + b]
         elif name == "kv_bank":
-            for i in range(n):
-                out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
+            for i in range(num_layers):
+                b = bi(i)
+                out[f"blocks.{i}.attn.c_k.weight"] = tensor[b]
+                out[f"blocks.{i}.attn.c_v.weight"] = tensor[nb + b]
         elif name == "mlp_up_bank":
-            for i in range(n):
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
+            for i in range(num_layers):
+                out[f"blocks.{i}.mlp.fc.weight"] = tensor[bi(i)]
         elif name == "mlp_down_bank":
-            for i in range(n):
-                out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+            for i in range(num_layers):
+                out[f"blocks.{i}.mlp.proj.weight"] = tensor[bi(i)]
         else:
             out[name] = tensor
     return out
 
-def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor], bank_idx_fn=None) -> dict[str, Tensor]:
     """Convert individual 2D tensors back into 3D bank tensors."""
     out: dict[str, Tensor] = {}
-    n = num_layers
-    # Reconstruct banks from individual weight keys
-    qo_slices = [None] * (2 * n)
-    kv_slices = [None] * (2 * n)
-    up_slices = [None] * n
-    down_slices = [None] * n
+    bi = bank_idx_fn if bank_idx_fn is not None else (lambda i: i)
+    nb = template_sd["qo_bank"].shape[0] // 2  # infer nb from template
+    # Accumulate into bank slots (average if multiple layers map to same slot)
+    qo_accum = [[] for _ in range(2 * nb)]
+    kv_accum = [[] for _ in range(2 * nb)]
+    up_accum = [[] for _ in range(nb)]
+    down_accum = [[] for _ in range(nb)]
     consumed = set()
-    for i in range(n):
+    for i in range(num_layers):
+        b = bi(i)
         qk = f"blocks.{i}.attn.c_q.weight"
         if qk in sd:
-            qo_slices[i] = sd[qk]
+            qo_accum[b].append(sd[qk])
             consumed.add(qk)
         ok = f"blocks.{i}.attn.proj.weight"
         if ok in sd:
-            qo_slices[n + i] = sd[ok]
+            qo_accum[nb + b].append(sd[ok])
             consumed.add(ok)
         kk = f"blocks.{i}.attn.c_k.weight"
         if kk in sd:
-            kv_slices[i] = sd[kk]
+            kv_accum[b].append(sd[kk])
             consumed.add(kk)
         vk = f"blocks.{i}.attn.c_v.weight"
         if vk in sd:
-            kv_slices[n + i] = sd[vk]
+            kv_accum[nb + b].append(sd[vk])
             consumed.add(vk)
         fk = f"blocks.{i}.mlp.fc.weight"
         if fk in sd:
-            up_slices[i] = sd[fk]
+            up_accum[b].append(sd[fk])
             consumed.add(fk)
         dk = f"blocks.{i}.mlp.proj.weight"
         if dk in sd:
-            down_slices[i] = sd[dk]
+            down_accum[b].append(sd[dk])
             consumed.add(dk)
-    out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
-    out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
-    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
-    out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
+    def _avg(lst):
+        return sum(lst) / len(lst) if lst else lst[0]
+    out["qo_bank"] = torch.stack([_avg(s) for s in qo_accum]).to(dtype=template_sd["qo_bank"].dtype)
+    out["kv_bank"] = torch.stack([_avg(s) for s in kv_accum]).to(dtype=template_sd["kv_bank"].dtype)
+    out["mlp_up_bank"] = torch.stack([_avg(s) for s in up_accum]).to(dtype=template_sd["mlp_up_bank"].dtype)
+    out["mlp_down_bank"] = torch.stack([_avg(s) for s in down_accum]).to(dtype=template_sd["mlp_down_bank"].dtype)
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1787,7 +1794,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers, bank_idx_fn=base_model._bank_idx)
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
@@ -1810,7 +1817,7 @@ def main() -> None:
     )
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
     # Re-bank the dequantized tensors
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
+    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu, bank_idx_fn=base_model._bank_idx)
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
@@ -1822,6 +1829,8 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        share_body=args.share_body, num_stem_layers=args.num_stem_layers,
+        num_head_layers=args.num_head_layers, num_body_kernels=args.num_body_kernels,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
