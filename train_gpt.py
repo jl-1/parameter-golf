@@ -614,12 +614,13 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float,
+                 shared_attn: "CausalSelfAttention | None" = None, shared_mlp: "MLP | None" = None):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = shared_attn if shared_attn is not None else CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = shared_mlp if shared_mlp is not None else MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -672,17 +673,26 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.smear = SmearGate(model_dim)
-        # Build unique Block instances; body layers reuse shared kernel blocks
+        # Build blocks; body layers share heavy weights (attn, mlp) but keep own norms/scales
         if share_body:
-            num_unique = num_stem_layers + num_body_kernels + num_head_layers
-            unique_blocks = [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for _ in range(num_unique)
-            ]
-            self.unique_blocks = nn.ModuleList(unique_blocks)
+            # Create shared kernel sub-modules
+            self.shared_attns = nn.ModuleList([
+                CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+                for _ in range(num_body_kernels)
+            ])
+            self.shared_mlps = nn.ModuleList([
+                MLP(model_dim, mlp_mult) for _ in range(num_body_kernels)
+            ])
             block_list = []
             for i in range(num_layers):
-                block_list.append(unique_blocks[self._block_idx(i)])
+                if i < num_stem_layers or i >= num_layers - num_head_layers:
+                    # Stem/head: fully unique block
+                    block_list.append(Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init))
+                else:
+                    # Body: unique norms/scales, shared attn/mlp
+                    k = (i - num_stem_layers) % num_body_kernels
+                    block_list.append(Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                                           shared_attn=self.shared_attns[k], shared_mlp=self.shared_mlps[k]))
             self.blocks = nn.ModuleList(block_list)
         else:
             self.blocks = nn.ModuleList(
@@ -1021,12 +1031,11 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     if args.share_body:
         num_body_apps = args.num_layers - args.num_stem_layers - args.num_head_layers
-        num_unique = args.num_stem_layers + args.num_body_kernels + args.num_head_layers
-        unique_params = sum(p.numel() for p in base_model.unique_blocks.parameters())
+        shared_params = sum(p.numel() for p in base_model.shared_attns.parameters()) + sum(p.numel() for p in base_model.shared_mlps.parameters())
         log0(
             f"shared_body: stem={args.num_stem_layers} body_apps={num_body_apps} "
             f"kernels={args.num_body_kernels} head={args.num_head_layers} "
-            f"unique_blocks={num_unique} unique_block_params={unique_params}"
+            f"shared_kernel_params={shared_params}"
         )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
