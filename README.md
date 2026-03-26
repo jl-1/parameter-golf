@@ -232,3 +232,22 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 Join the [OpenAI Discord server](https://discord.com/invite/openai) and visit the Parameter Golf channels (#parameter-golf-discussions, #parameter-golf-announcements) and ask questions.
 
 This repository adapts code from `modded-nanogpt`, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
+
+---
+
+## Training Commands (SOTA + Alternating Shared Body)
+
+**Baseline (no sharing, SOTA defaults):**
+```bash
+torchrun --nproc_per_node=8 train_gpt.py
+```
+
+**Shared body with larger model (dim=640, 15 layers):**
+```bash
+SHARE_BODY=1 MODEL_DIM=640 NUM_LAYERS=15 NUM_HEADS=10 NUM_KV_HEADS=5 NUM_STEM_LAYERS=2 NUM_HEAD_LAYERS=2 NUM_BODY_KERNELS=2 MATRIX_LR=0.01 SCALAR_LR=0.01 torchrun --nproc_per_node=8 train_gpt.py
+```
+
+**Quick 1-minute test (single GPU):**
+```bash
+SHARE_BODY=1 MODEL_DIM=640 NUM_LAYERS=15 NUM_HEADS=10 NUM_KV_HEADS=5 NUM_STEM_LAYERS=2 NUM_HEAD_LAYERS=2 NUM_BODY_KERNELS=2 MATRIX_LR=0.01 SCALAR_LR=0.01 MAX_WALLCLOCK_SECONDS=60 torchrun --nproc_per_node=1 train_gpt.py
+```
