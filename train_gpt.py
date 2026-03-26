@@ -293,7 +293,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,stem_gate",
     ).split(",")
     if pattern
 )
@@ -636,6 +636,7 @@ class BodyControl(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.stem_gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
 
 class Block(nn.Module):
@@ -748,9 +749,11 @@ class GPT(nn.Module):
             for block in self.stem_blocks:
                 x = block(x, x0)
                 skips.append(x)
+            x_stem = x  # save final stem output for body residual connections
             # Body: alternating shared kernels with per-application controls.
             for i, ctrl in enumerate(self.body_controls):
                 kernel = self.body_kernels[i % self.num_body_kernels]
+                x = x + ctrl.stem_gate.to(dtype=x.dtype)[None, None, :] * x_stem
                 x = kernel(x, x0, controls=ctrl)
             # Head: unique layers, consume skip connections from stem in reverse.
             for i, block in enumerate(self.head_blocks):
