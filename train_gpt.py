@@ -661,12 +661,24 @@ class Block(nn.Module):
             self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor, controls: BodyControl | None = None) -> Tensor:
-        src = controls if controls is not None else self
-        mix = src.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + src.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + src.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if controls is not None:
+            src = controls
+            mix = src.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + src.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + src.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        elif hasattr(self, "resid_mix"):
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        else:
+            # No controls — pure iterative refinement
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + attn_out
+            x = x + self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -713,9 +725,9 @@ class GPT(nn.Module):
             self.num_stem_layers = num_stem_layers
             self.num_head_layers = num_head_layers
             self.num_body_kernels = num_body_kernels
+            self.num_body_apps = num_body_apps
             self.stem_blocks = nn.ModuleList([_make_block() for _ in range(num_stem_layers)])
             self.body_kernels = nn.ModuleList([_make_block(include_controls=False) for _ in range(num_body_kernels)])
-            self.body_controls = nn.ModuleList([BodyControl(model_dim) for _ in range(num_body_apps)])
             self.head_blocks = nn.ModuleList([_make_block() for _ in range(num_head_layers)])
             self.num_skip_weights = min(num_stem_layers, num_head_layers)
         else:
@@ -750,11 +762,10 @@ class GPT(nn.Module):
                 x = block(x, x0)
                 skips.append(x)
             x_stem = x  # save final stem output for body residual connections
-            # Body: alternating shared kernels with per-application controls.
-            for i, ctrl in enumerate(self.body_controls):
+            # Body: alternating shared kernels, pure iterative refinement.
+            for i in range(self.num_body_apps):
                 kernel = self.body_kernels[i % self.num_body_kernels]
-                x = x + ctrl.stem_gate.to(dtype=x.dtype)[None, None, :] * x_stem
-                x = kernel(x, x0, controls=ctrl)
+                x = kernel(x, x0)
             # Head: unique layers, consume skip connections from stem in reverse.
             for i, block in enumerate(self.head_blocks):
                 if skips:
@@ -962,11 +973,10 @@ def main() -> None:
     if args.share_body:
         num_body_apps = args.num_layers - args.num_stem_layers - args.num_head_layers
         kernel_params = sum(p.numel() for p in base_model.body_kernels.parameters())
-        ctrl_params = sum(p.numel() for p in base_model.body_controls.parameters())
         log0(
             f"shared_body: stem={args.num_stem_layers} body_apps={num_body_apps} "
             f"kernels={args.num_body_kernels} head={args.num_head_layers} "
-            f"kernel_params={kernel_params} control_params={ctrl_params}"
+            f"kernel_params={kernel_params}"
         )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
