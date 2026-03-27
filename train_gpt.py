@@ -272,7 +272,7 @@ def eval_val(
                 x = local[:-1].unsqueeze(0)
                 y = local[1:].unsqueeze(0)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    per_token = base.forward_per_token_loss(x, y)  # (1, seq_len)
+                    per_token = forward_per_token_loss(base, x, y)  # (1, seq_len)
                 score_from = 0 if win_start == 0 else seq_len - stride
                 scored = per_token[0, score_from:]
                 val_loss_sum += scored.to(torch.float64).sum()
@@ -928,45 +928,46 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
-    @torch.no_grad()
-    def forward_per_token_loss(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        """Non-compiled path returning per-token losses shaped (B, T)."""
-        # Reuse the forward graph up to logits, then compute unreduced loss.
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-        if self.share_body:
-            for block in self.stem_blocks:
-                x = block(x, x0)
-                skips.append(x)
-            x_stem = x
-            n_controls = len(self.body_controls)
-            for i in range(self.num_body_apps):
-                kernel = self.body_kernels[i % self.num_body_kernels]
-                ctrl = self.body_controls[i % n_controls]
-                ref = x_stem if (i % 2 == 0) else x
-                x = kernel(x, ref, controls=ctrl)
-            for i, block in enumerate(self.head_blocks):
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x = block(x, x0)
-        else:
-            for i in range(self.num_encoder_layers):
-                x = self.blocks[i](x, x0)
-                skips.append(x)
-            for i in range(self.num_decoder_layers):
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x = self.blocks[self.num_encoder_layers + i](x, x0)
-        B, T = input_ids.shape
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="none").view(B, T)
+
+@torch.no_grad()
+def forward_per_token_loss(model: GPT, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    """Standalone non-compiled path returning per-token losses shaped (B, T).
+    Kept outside GPT class to avoid interfering with torch.compile."""
+    x = model.tok_emb(input_ids)
+    x = F.rms_norm(x, (x.size(-1),))
+    x0 = x
+    skips: list[Tensor] = []
+    if model.share_body:
+        for block in model.stem_blocks:
+            x = block(x, x0)
+            skips.append(x)
+        x_stem = x
+        n_controls = len(model.body_controls)
+        for i in range(model.num_body_apps):
+            kernel = model.body_kernels[i % model.num_body_kernels]
+            ctrl = model.body_controls[i % n_controls]
+            ref = x_stem if (i % 2 == 0) else x
+            x = kernel(x, ref, controls=ctrl)
+        for i, block in enumerate(model.head_blocks):
+            if skips:
+                x = x + model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = block(x, x0)
+    else:
+        for i in range(model.num_encoder_layers):
+            x = model.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(model.num_decoder_layers):
+            if skips:
+                x = x + model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = model.blocks[model.num_encoder_layers + i](x, x0)
+    B, T = input_ids.shape
+    x = model.final_norm(x).reshape(-1, x.size(-1))
+    if model.tie_embeddings:
+        logits_proj = F.linear(x, model.tok_emb.weight)
+    else:
+        logits_proj = model.lm_head(x)
+    logits = model.logit_softcap * torch.tanh(logits_proj / model.logit_softcap)
+    return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="none").view(B, T)
 
 
 # -----------------------------
