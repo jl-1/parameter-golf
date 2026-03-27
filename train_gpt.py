@@ -253,51 +253,66 @@ def eval_val(
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     seq_len = args.train_seq_len
     stride = args.eval_stride if (sliding_window and args.eval_stride > 0) else seq_len
+    use_sliding = stride < seq_len
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    # Get the underlying model for per-token loss flag
     base = model.module if hasattr(model, "module") else model
-    use_per_token = stride < seq_len
-    if use_per_token:
-        base._return_per_token_loss = True
 
-    total_tokens = val_tokens.numel()
-    # Distribute windows across ranks
-    all_starts = list(range(0, total_tokens - seq_len, stride))
-    rank_starts = all_starts[rank::world_size]
-
-    with torch.inference_mode():
-        for win_start in rank_starts:
-            win_end = win_start + seq_len + 1
-            local = val_tokens[win_start:win_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].unsqueeze(0)  # (1, seq_len)
-            y = local[1:].unsqueeze(0)   # (1, seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss_out = model(x, y).detach()
-            if use_per_token:
-                # Only score the last `stride` tokens (they have full context)
-                # For the very first window, score all tokens
+    if use_sliding:
+        # Sliding window: use uncompiled forward_per_token_loss, score only suffix tokens.
+        total_tokens = val_tokens.numel()
+        all_starts = list(range(0, total_tokens - seq_len, stride))
+        rank_starts = all_starts[rank::world_size]
+        with torch.inference_mode():
+            for win_start in rank_starts:
+                local = val_tokens[win_start:win_start + seq_len + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].unsqueeze(0)
+                y = local[1:].unsqueeze(0)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    per_token = base.forward_per_token_loss(x, y)  # (1, seq_len)
                 score_from = 0 if win_start == 0 else seq_len - stride
-                per_token = loss_out[0, score_from:]  # (score_len,)
-                val_loss_sum += per_token.to(torch.float64).sum()
-                scored_count = per_token.numel()
-                val_token_count += scored_count
+                scored = per_token[0, score_from:]
+                val_loss_sum += scored.to(torch.float64).sum()
+                val_token_count += scored.numel()
                 prev_ids = x[0, score_from:]
                 tgt_ids = y[0, score_from:]
-            else:
-                val_loss_sum += loss_out.to(torch.float64) * float(y.numel())
-                val_token_count += float(y.numel())
+                tb = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += tb.to(torch.float64).sum()
+    else:
+        # Original batched eval (fast, used during training).
+        local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+        if local_batch_tokens < seq_len:
+            raise ValueError(
+                "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+                f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+                f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={seq_len}"
+            )
+        local_batch_seqs = local_batch_tokens // seq_len
+        total_seqs = (val_tokens.numel() - 1) // seq_len
+        seq_start = (total_seqs * rank) // world_size
+        seq_end = (total_seqs * (rank + 1)) // world_size
+        with torch.inference_mode():
+            for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+                batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+                raw_start = batch_seq_start * seq_len
+                raw_end = batch_seq_end * seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].reshape(-1, seq_len)
+                y = local[1:].reshape(-1, seq_len)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = model(x, y).detach()
+                batch_token_count = float(y.numel())
+                val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+                val_token_count += batch_token_count
                 prev_ids = x.reshape(-1)
                 tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
-
-    if use_per_token:
-        base._return_per_token_loss = False
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -855,7 +870,6 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self._return_per_token_loss = False
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -912,9 +926,47 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        if self._return_per_token_loss:
-            return F.cross_entropy(logits.float(), targets, reduction="none").view(input_ids.shape)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+    @torch.no_grad()
+    def forward_per_token_loss(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        """Non-compiled path returning per-token losses shaped (B, T)."""
+        # Reuse the forward graph up to logits, then compute unreduced loss.
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        if self.share_body:
+            for block in self.stem_blocks:
+                x = block(x, x0)
+                skips.append(x)
+            x_stem = x
+            n_controls = len(self.body_controls)
+            for i in range(self.num_body_apps):
+                kernel = self.body_kernels[i % self.num_body_kernels]
+                ctrl = self.body_controls[i % n_controls]
+                ref = x_stem if (i % 2 == 0) else x
+                x = kernel(x, ref, controls=ctrl)
+            for i, block in enumerate(self.head_blocks):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = block(x, x0)
+        else:
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
+        B, T = input_ids.shape
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="none").view(B, T)
 
 
 # -----------------------------
